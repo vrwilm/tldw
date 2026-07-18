@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -20,15 +21,24 @@ import httpx
 
 BUILTIN_MODEL = "google/gemini-2.5-flash-lite"
 
+# `or` rather than a get() default: the XDG spec says an empty value means unset,
+# and Path("") would silently resolve relative to the current directory.
 CONFIG = Path(
-    os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+    os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
 ) / "tldw" / "config.json"
 
 CACHE = Path(
-    os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
+    os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
 ) / "tldw"
 
 VIDEO_ID = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})")
+
+# Order we actually want, which is NOT alphabetical: sorted() puts "sub.en-GB.vtt"
+# before "sub.en.vtt" ('-' < '.'), silently preferring a machine-translated track
+# over the original.
+SUB_PREF = ["en-orig", "en", "en-US", "en-GB"]
+
+CACHE_FIELDS = ("id", "title", "transcript", "summary")
 
 PROMPT = """Below is the transcript of a YouTube video (auto-generated captions, \
 so expect missing punctuation and occasional mis-transcriptions).
@@ -51,7 +61,8 @@ Be concise. No preamble — start with the gist.
 
 def load_config() -> dict:
     try:
-        return json.loads(CONFIG.read_text())
+        cfg = json.loads(CONFIG.read_text())
+        return cfg if isinstance(cfg, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
 
@@ -67,18 +78,32 @@ def save_config(cfg: dict) -> None:
 
 # ---------------------------------------------------------------- cache
 
-def cache_read(video_id: str) -> dict | None:
+def cache_read(video_id: str | None) -> dict | None:
+    if not video_id:
+        return None
     try:
-        return json.loads((CACHE / f"{video_id}.json").read_text())
+        entry = json.loads((CACHE / f"{video_id}.json").read_text())
     except (OSError, json.JSONDecodeError):
         return None
+    # A truncated or hand-edited entry is a cache miss, not a traceback.
+    if not isinstance(entry, dict) or not all(entry.get(k) for k in CACHE_FIELDS):
+        return None
+    return entry
 
 
-def cache_write(video_id: str, entry: dict) -> None:
+def cache_write(entry: dict, alias: str | None = None) -> None:
     """Best-effort, same reasoning as save_config."""
+    video_id = entry.get("id")
+    if not video_id:
+        return  # never create CACHE/".json" or point `last` at nothing
     try:
         CACHE.mkdir(parents=True, exist_ok=True)
-        (CACHE / f"{video_id}.json").write_text(json.dumps(entry))
+        blob = json.dumps(entry)
+        (CACHE / f"{video_id}.json").write_text(blob)
+        # If the URL's ID didn't match yt-dlp's canonical one, store it under both
+        # so the next run of the same URL still hits.
+        if alias and alias != video_id:
+            (CACHE / f"{alias}.json").write_text(blob)
         (CACHE / "last").write_text(video_id)
     except OSError:
         pass
@@ -93,8 +118,18 @@ def cache_last() -> dict | None:
 
 # ---------------------------------------------------------------- transcript
 
+def pick_sub(vtts: list[Path]) -> Path:
+    def rank(p: Path) -> int:
+        lang = p.stem.split(".")[-1]
+        return SUB_PREF.index(lang) if lang in SUB_PREF else len(SUB_PREF)
+    return min(vtts, key=rank)
+
+
 def fetch(url: str) -> tuple[str, str, str]:
     """Return (video_id, title, transcript) for a YouTube URL."""
+    if not shutil.which("yt-dlp"):
+        sys.exit("`yt-dlp` not found on PATH. Install it: https://github.com/yt-dlp/yt-dlp")
+
     with tempfile.TemporaryDirectory() as tmp:
         proc = subprocess.run(
             [
@@ -103,6 +138,10 @@ def fetch(url: str) -> tuple[str, str, str]:
                 # --print implies --simulate, which silently suppresses subtitle
                 # writing. --no-simulate turns that back off.
                 "--no-simulate",
+                # A URL copied from a playlist (watch?v=X&list=Y) otherwise expands
+                # to the whole playlist: every entry overwrites the same output
+                # file, so the title and the transcript end up from different videos.
+                "--no-playlist",
                 "--write-subs",
                 "--write-auto-subs",
                 # Deliberately narrow: "en.*" also pulls every machine-translated
@@ -123,12 +162,12 @@ def fetch(url: str) -> tuple[str, str, str]:
         video_id = out[0] if out else ""
         title = out[1] if len(out) > 1 else "(unknown)"
 
-        vtts = sorted(Path(tmp).glob("*.vtt"))
+        vtts = list(Path(tmp).glob("*.vtt"))
         # A nonzero exit on one subtitle track doesn't matter if another landed.
         if not vtts:
             err = proc.stderr.strip() or "No English subtitles available for this video."
             sys.exit(err)
-        return video_id, title, parse_vtt(vtts[0].read_text(encoding="utf-8"))
+        return video_id, title, parse_vtt(pick_sub(vtts).read_text(encoding="utf-8"))
 
 
 def parse_vtt(raw: str) -> str:
@@ -177,14 +216,28 @@ def via_openrouter(messages: list[dict], model: str) -> str:
             if payload == "[DONE]":
                 break
             try:
-                delta = json.loads(payload)["choices"][0]["delta"].get("content")
-            except (json.JSONDecodeError, KeyError, IndexError):
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            # Mid-stream errors arrive after a 200. Without this they'd be
+            # swallowed and cached as a successful but empty summary.
+            if isinstance(obj, dict) and obj.get("error"):
+                err = obj["error"]
+                msg = err.get("message", err) if isinstance(err, dict) else err
+                sys.exit(f"\nOpenRouter stream error: {msg}")
+            try:
+                delta = obj["choices"][0]["delta"].get("content")
+            except (KeyError, IndexError, TypeError):
                 continue
             if delta:
                 chunks.append(delta)
                 print(delta, end="", flush=True)
     print()
-    return "".join(chunks)
+
+    text = "".join(chunks).strip()
+    if not text:
+        sys.exit("Model returned an empty response.")
+    return text
 
 
 def via_claude(messages: list[dict]) -> str:
@@ -205,35 +258,68 @@ def via_claude(messages: list[dict]) -> str:
             parts.append(f"<your_previous_answer>\n{m['content']}\n</your_previous_answer>")
     prompt = "\n\n".join(parts)
 
-    chunks: list[str] = []
+    # Prompt goes over stdin, not argv, so a long transcript can't hit ARG_MAX.
+    # Fed from a thread so a full pipe buffer can't deadlock against our reads.
     proc = subprocess.Popen(
-        ["claude", "-p", prompt], stdout=subprocess.PIPE, text=True, bufsize=1
+        ["claude", "-p"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
     )
+
+    def feed() -> None:
+        try:
+            proc.stdin.write(prompt)
+        except BrokenPipeError:
+            pass
+        finally:
+            proc.stdin.close()
+
+    threading.Thread(target=feed, daemon=True).start()
+
+    chunks: list[str] = []
     for line in proc.stdout:
         chunks.append(line)
         print(line, end="", flush=True)
     if proc.wait() != 0:
-        sys.exit(proc.returncode)
-    return "".join(chunks)
+        sys.exit(f"claude exited {proc.returncode}")
+
+    text = "".join(chunks).strip()
+    if not text:
+        sys.exit("claude returned an empty response.")
+    return text
 
 
 # ---------------------------------------------------------------- chat
 
-def chat_loop(messages: list[dict], backend: str, model: str) -> None:
+def chat_loop(messages: list[dict], backend: str, model: str) -> bool:
+    """Returns False if the session couldn't start (not a terminal)."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        return  # piped or redirected — stay one-shot
+        return False  # piped or redirected — stay one-shot
     print("\nAsk a follow-up (Ctrl-D or empty line to quit).", file=sys.stderr)
     while True:
         try:
             q = input("\n> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
-            return
+            return True
         if not q:
-            return
+            return True
         print()
         messages.append({"role": "user", "content": q})
-        messages.append({"role": "assistant", "content": respond(messages, backend, model)})
+        try:
+            answer = respond(messages, backend, model)
+        except SystemExit as e:
+            # A transient API error shouldn't discard the whole conversation.
+            print(f"error: {e}", file=sys.stderr)
+            messages.pop()
+            continue
+        messages.append({"role": "assistant", "content": answer})
+
+
+def seed(title: str, transcript: str, summary: str | None = None) -> list[dict]:
+    messages = [{"role": "user", "content": PROMPT.format(title=title, transcript=transcript)}]
+    if summary:
+        messages.append({"role": "assistant", "content": summary})
+    return messages
 
 
 def settings(args, cfg: dict) -> tuple[str, str]:
@@ -269,7 +355,8 @@ def cmd_summarize(argv: list[str]) -> None:
 
     # Transcripts never change, so a cache hit skips the network entirely.
     m = VIDEO_ID.search(args.url)
-    hit = None if args.fresh else (cache_read(m.group(1)) if m else None)
+    url_id = m.group(1) if m else None
+    hit = None if args.fresh else cache_read(url_id)
 
     if hit:
         video_id, title, transcript = hit["id"], hit["title"], hit["transcript"]
@@ -277,27 +364,30 @@ def cmd_summarize(argv: list[str]) -> None:
     else:
         print("Fetching transcript...", file=sys.stderr)
         video_id, title, transcript = fetch(args.url)
-        if len(transcript) < 200:
-            sys.exit("Transcript too short to summarize.")
+
+    # Validated on every path, not just on a fresh fetch.
+    if len(transcript) < 200:
+        sys.exit("Transcript too short to summarize.")
 
     label = model if backend == "openrouter" else "claude -p"
     print(f"Summarizing ({label}): {title}\n", file=sys.stderr)
 
-    messages = [{"role": "user", "content": PROMPT.format(title=title, transcript=transcript)}]
+    messages = seed(title, transcript)
     summary = respond(messages, backend, model)
     messages.append({"role": "assistant", "content": summary})
 
-    cache_write(video_id, {
+    cache_write({
         "id": video_id, "url": args.url, "title": title,
         "transcript": transcript, "summary": summary, "ts": int(time.time()),
-    })
+    }, alias=url_id)
 
-    # Persist only explicit flags, and only after a successful run: env vars stay
-    # transient, and a typo'd slug can't poison future invocations.
+    # Persist only explicit flags, and only after a successful run. Read from
+    # args/cfg alone -- resolved values fold in env vars, which must stay
+    # transient, and a typo'd slug must not poison future invocations.
     if args.backend or args.model:
         save_config({
-            "backend": args.backend or cfg.get("backend") or backend,
-            "model": args.model or cfg.get("model") or model,
+            "backend": args.backend or cfg.get("backend") or "openrouter",
+            "model": args.model or cfg.get("model") or BUILTIN_MODEL,
         })
 
     if args.chat:
@@ -317,19 +407,14 @@ def cmd_ask(argv: list[str]) -> None:
     backend, model = settings(args, load_config())
     print(f"Re: {entry['title']}", file=sys.stderr)
 
-    messages = [
-        {"role": "user", "content": PROMPT.format(
-            title=entry["title"], transcript=entry["transcript"])},
-        {"role": "assistant", "content": entry["summary"]},
-    ]
+    messages = seed(entry["title"], entry["transcript"], entry["summary"])
 
     if args.question:
-        q = " ".join(args.question)
         print(file=sys.stderr)
-        messages.append({"role": "user", "content": q})
+        messages.append({"role": "user", "content": " ".join(args.question)})
         messages.append({"role": "assistant", "content": respond(messages, backend, model)})
-    else:
-        chat_loop(messages, backend, model)
+    elif not chat_loop(messages, backend, model):
+        sys.exit("No question given, and stdin is not a terminal. Pass one: tldw ask 'your question'")
 
 
 def main() -> None:
