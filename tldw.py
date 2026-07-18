@@ -206,6 +206,23 @@ def via_openrouter(messages: list[dict], model: str) -> str:
         sys.exit("OPENROUTER_API_KEY not set. Get one at https://openrouter.ai/keys")
 
     chunks: list[str] = []
+    try:
+        _stream_openrouter(chunks, key, model, messages)
+    except httpx.HTTPError as e:
+        # httpx errors derive from Exception, not OSError, so without this a
+        # dropped connection or read timeout escapes as a traceback and takes
+        # the whole chat session with it.
+        raise BackendError(f"OpenRouter request failed: {e}") from e
+
+    text = "".join(chunks).strip()
+    if not text:
+        raise BackendError("Model returned an empty response.")
+    return text
+
+
+def _stream_openrouter(chunks: list[str], key: str, model: str, messages: list[dict]) -> None:
+    """Appends streamed text to `chunks`. Split out only so the caller can wrap
+    the whole request in one httpx.HTTPError handler."""
     with httpx.stream(
         "POST",
         "https://openrouter.ai/api/v1/chat/completions",
@@ -243,11 +260,6 @@ def via_openrouter(messages: list[dict], model: str) -> str:
                 chunks.append(delta)
                 print(delta, end="", flush=True)
     print()
-
-    text = "".join(chunks).strip()
-    if not text:
-        raise BackendError("Model returned an empty response.")
-    return text
 
 
 def via_claude(messages: list[dict]) -> str:
