@@ -445,6 +445,12 @@ def main() -> None:
         sys.exit(str(e))
     except KeyboardInterrupt:
         sys.exit(130)
+    except BrokenPipeError:
+        # `tldw <url> | head` closes the pipe early. Standard tools exit quietly;
+        # without redirecting the fd, Python also prints "Exception ignored" when
+        # it flushes stdout at shutdown.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(141)  # 128 + SIGPIPE
 
 
 if __name__ == "__main__":
