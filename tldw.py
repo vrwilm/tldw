@@ -282,7 +282,7 @@ def via_claude(messages: list[dict]) -> str:
         try:
             proc.stdin.write(prompt)
             proc.stdin.close()
-        except (BrokenPipeError, OSError):
+        except OSError:  # BrokenPipeError is a subclass
             pass
 
     threading.Thread(target=feed, daemon=True).start()
@@ -420,18 +420,19 @@ def cmd_ask(argv: list[str]) -> None:
     backend, model = settings(args, load_config())
     print(f"Re: {entry['title']}", file=sys.stderr)
 
-    messages = seed(entry["title"], entry["transcript"], entry["summary"])
+    # .get: cache_read deliberately accepts entries without a summary.
+    messages = seed(entry["title"], entry["transcript"], entry.get("summary"))
 
     if args.question:
         print(file=sys.stderr)
         messages.append({"role": "user", "content": " ".join(args.question)})
         messages.append({"role": "assistant", "content": respond(messages, backend, model)})
     elif not chat_loop(messages, backend, model):
-        # Only a non-interactive *stdin* is a usage error. Redirecting stdout
-        # alone is legitimate, and the summarize path stays silent about it too.
-        if not sys.stdin.isatty():
-            sys.exit("No question given, and stdin is not a terminal. "
-                     "Pass one: tldw ask 'your question'")
+        # Reached only when no question was given AND no session could start,
+        # which is a usage error however the streams are wired -- otherwise the
+        # command produces no output and still reports success.
+        sys.exit("No question given, and no interactive session is possible. "
+                 "Pass one: tldw ask 'your question'")
 
 
 def main() -> None:
