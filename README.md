@@ -22,8 +22,9 @@ demonstrates every rhetorical trick used to *sound* smart while saying nothing.
 It pulls the video's captions with `yt-dlp`, strips the timestamps, and sends the
 text to an LLM. No API-heavy scraping, no Whisper transcription, no browser.
 
-One file, ~170 lines. Summarizing a two-hour video costs about **$0.002** on the
-default model — or nothing at all on the `claude` backend.
+One file, ~300 lines. Summarizing a two-hour video costs about **$0.002** on the
+default model — or nothing at all on the `claude` backend. Ask it follow-up
+questions with `-c`, or come back to any video later with `tldw ask`.
 
 ## Install
 
@@ -56,6 +57,54 @@ tldw 'https://...' --model deepseek/deepseek-v4-flash           # pick a model
 tldw 'https://...' --backend claude                             # no API key
 TLDW_MODEL=openai/gpt-5-nano tldw 'https://...'                 # one-off override
 ```
+
+## Follow-up questions
+
+A summary always leaves something out. Pass `-c` to keep the conversation open
+once it's printed:
+
+```console
+$ tldw -c 'https://www.youtube.com/watch?v=...'
+... summary ...
+
+Ask a follow-up (Ctrl-D or empty line to quit).
+
+> Name the single prop he uses.
+Glasses (frames).
+
+> Is it real?
+No, they are just frames.
+```
+
+Or come back to it later — every transcript is cached, so `ask` reopens the
+most recent video from any directory, in any terminal, days afterwards:
+
+```bash
+tldw ask 'What were the exact numbers he cited?'   # one-shot answer
+tldw ask                                           # interactive session
+```
+
+`-c` deliberately does nothing when output is piped or redirected, so the
+default stays scriptable:
+
+```bash
+tldw 'https://...' > summary.md     # never blocks waiting for input
+```
+
+## Caching
+
+Transcripts don't change, so each one is stored under `~/.cache/tldw/<video-id>.json`
+alongside its summary. Re-running a video you've already seen skips `yt-dlp`
+entirely — roughly two seconds instead of the usual fetch — and `tldw ask` reads
+straight from there.
+
+```bash
+tldw 'https://...' --fresh    # ignore the cache and re-fetch
+rm -rf ~/.cache/tldw          # clear everything
+```
+
+Nothing is ever evicted. Entries are small (tens of KB), but the directory grows
+forever; delete it whenever you like.
 
 ## Backends
 
