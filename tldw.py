@@ -34,11 +34,19 @@ CACHE = Path(
 VIDEO_ID = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})")
 
 # Order we actually want, which is NOT alphabetical: sorted() puts "sub.en-GB.vtt"
-# before "sub.en.vtt" ('-' < '.'), silently preferring a machine-translated track
-# over the original.
-SUB_PREF = ["en-orig", "en", "en-US", "en-GB"]
+# before "sub.en.vtt" ('-' < '.').
+# "en" is the human/community track where one exists; "en-orig" is raw ASR and
+# goes last. On the README's example video: en = 8KB of clean prose,
+# en-orig = 44KB of rolling auto-caption with duplicate timings.
+SUB_PREF = ["en", "en-US", "en-GB", "en-orig"]
 
-CACHE_FIELDS = ("id", "title", "transcript", "summary")
+# `summary` deliberately excluded: the summarize path only needs the transcript,
+# so a missing summary shouldn't force a full refetch.
+CACHE_FIELDS = ("id", "title", "transcript")
+
+
+class BackendError(Exception):
+    """A model/API failure. Recoverable inside a chat session, fatal outside one."""
 
 PROMPT = """Below is the transcript of a YouTube video (auto-generated captions, \
 so expect missing punctuation and occasional mis-transcriptions).
@@ -91,19 +99,14 @@ def cache_read(video_id: str | None) -> dict | None:
     return entry
 
 
-def cache_write(entry: dict, alias: str | None = None) -> None:
+def cache_write(entry: dict) -> None:
     """Best-effort, same reasoning as save_config."""
     video_id = entry.get("id")
     if not video_id:
         return  # never create CACHE/".json" or point `last` at nothing
     try:
         CACHE.mkdir(parents=True, exist_ok=True)
-        blob = json.dumps(entry)
-        (CACHE / f"{video_id}.json").write_text(blob)
-        # If the URL's ID didn't match yt-dlp's canonical one, store it under both
-        # so the next run of the same URL still hits.
-        if alias and alias != video_id:
-            (CACHE / f"{alias}.json").write_text(blob)
+        (CACHE / f"{video_id}.json").write_text(json.dumps(entry))
         (CACHE / "last").write_text(video_id)
     except OSError:
         pass
@@ -119,9 +122,10 @@ def cache_last() -> dict | None:
 # ---------------------------------------------------------------- transcript
 
 def pick_sub(vtts: list[Path]) -> Path:
-    def rank(p: Path) -> int:
+    def rank(p: Path) -> tuple[int, str]:
         lang = p.stem.split(".")[-1]
-        return SUB_PREF.index(lang) if lang in SUB_PREF else len(SUB_PREF)
+        # Name breaks ties: glob order follows the filesystem and isn't stable.
+        return (SUB_PREF.index(lang) if lang in SUB_PREF else len(SUB_PREF), p.name)
     return min(vtts, key=rank)
 
 
@@ -138,10 +142,14 @@ def fetch(url: str) -> tuple[str, str, str]:
                 # --print implies --simulate, which silently suppresses subtitle
                 # writing. --no-simulate turns that back off.
                 "--no-simulate",
-                # A URL copied from a playlist (watch?v=X&list=Y) otherwise expands
-                # to the whole playlist: every entry overwrites the same output
-                # file, so the title and the transcript end up from different videos.
+                # Two different cases, so both flags are needed:
+                #   watch?v=X&list=Y  -- --no-playlist pins it to video X.
+                #   /playlist?list=Y  -- not a video URL, so --no-playlist does
+                #     nothing and it still expands to every entry; each one
+                #     overwrites the same output file, leaving the title from
+                #     entry 1 and the transcript from whichever entry wrote last.
                 "--no-playlist",
+                "--playlist-items", "1",
                 "--write-subs",
                 "--write-auto-subs",
                 # Deliberately narrow: "en.*" also pulls every machine-translated
@@ -207,7 +215,7 @@ def via_openrouter(messages: list[dict], model: str) -> str:
     ) as r:
         if r.status_code != 200:
             r.read()
-            sys.exit(f"OpenRouter {r.status_code}: {r.text.strip()}")
+            raise BackendError(f"OpenRouter {r.status_code}: {r.text.strip()}")
         for line in r.iter_lines():
             # OpenRouter sends ": OPENROUTER PROCESSING" keepalive comments.
             if not line.startswith("data: "):
@@ -224,10 +232,12 @@ def via_openrouter(messages: list[dict], model: str) -> str:
             if isinstance(obj, dict) and obj.get("error"):
                 err = obj["error"]
                 msg = err.get("message", err) if isinstance(err, dict) else err
-                sys.exit(f"\nOpenRouter stream error: {msg}")
+                raise BackendError(f"OpenRouter stream error: {str(msg).strip()}")
             try:
+                # AttributeError covers {"choices":[{"delta":null}]}, which is
+                # legal SSE and would otherwise abort a chat session.
                 delta = obj["choices"][0]["delta"].get("content")
-            except (KeyError, IndexError, TypeError):
+            except (KeyError, IndexError, TypeError, AttributeError):
                 continue
             if delta:
                 chunks.append(delta)
@@ -236,7 +246,7 @@ def via_openrouter(messages: list[dict], model: str) -> str:
 
     text = "".join(chunks).strip()
     if not text:
-        sys.exit("Model returned an empty response.")
+        raise BackendError("Model returned an empty response.")
     return text
 
 
@@ -266,12 +276,14 @@ def via_claude(messages: list[dict]) -> str:
     )
 
     def feed() -> None:
+        # close() flushes, so if the child died early the EPIPE lands here, not
+        # on write(). Both must be inside the guard or the thread dumps a
+        # traceback over the real error message.
         try:
             proc.stdin.write(prompt)
-        except BrokenPipeError:
-            pass
-        finally:
             proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
 
     threading.Thread(target=feed, daemon=True).start()
 
@@ -280,11 +292,11 @@ def via_claude(messages: list[dict]) -> str:
         chunks.append(line)
         print(line, end="", flush=True)
     if proc.wait() != 0:
-        sys.exit(f"claude exited {proc.returncode}")
+        raise BackendError(f"claude exited {proc.returncode}")
 
     text = "".join(chunks).strip()
     if not text:
-        sys.exit("claude returned an empty response.")
+        raise BackendError("claude returned an empty response.")
     return text
 
 
@@ -307,9 +319,11 @@ def chat_loop(messages: list[dict], backend: str, model: str) -> bool:
         messages.append({"role": "user", "content": q})
         try:
             answer = respond(messages, backend, model)
-        except SystemExit as e:
-            # A transient API error shouldn't discard the whole conversation.
-            print(f"error: {e}", file=sys.stderr)
+        except (BackendError, KeyboardInterrupt) as e:
+            # Only recoverable failures land here. Missing keys and missing
+            # binaries still sys.exit, rather than looping the same error
+            # forever with no way to fix it from inside the prompt.
+            print(f"\nerror: {e or type(e).__name__}", file=sys.stderr)
             messages.pop()
             continue
         messages.append({"role": "assistant", "content": answer})
@@ -379,16 +393,15 @@ def cmd_summarize(argv: list[str]) -> None:
     cache_write({
         "id": video_id, "url": args.url, "title": title,
         "transcript": transcript, "summary": summary, "ts": int(time.time()),
-    }, alias=url_id)
+    })
 
-    # Persist only explicit flags, and only after a successful run. Read from
-    # args/cfg alone -- resolved values fold in env vars, which must stay
-    # transient, and a typo'd slug must not poison future invocations.
-    if args.backend or args.model:
-        save_config({
-            "backend": args.backend or cfg.get("backend") or "openrouter",
-            "model": args.model or cfg.get("model") or BUILTIN_MODEL,
-        })
+    # Persist only explicit flags, and only after a successful run: resolved
+    # values fold in env vars, which must stay transient, and a typo'd slug must
+    # not poison future invocations. Merge rather than replace, so hand-added
+    # keys in config.json survive.
+    explicit = {k: v for k, v in (("backend", args.backend), ("model", args.model)) if v}
+    if explicit:
+        save_config(cfg | explicit)
 
     if args.chat:
         chat_loop(messages, backend, model)
@@ -414,14 +427,23 @@ def cmd_ask(argv: list[str]) -> None:
         messages.append({"role": "user", "content": " ".join(args.question)})
         messages.append({"role": "assistant", "content": respond(messages, backend, model)})
     elif not chat_loop(messages, backend, model):
-        sys.exit("No question given, and stdin is not a terminal. Pass one: tldw ask 'your question'")
+        # Only a non-interactive *stdin* is a usage error. Redirecting stdout
+        # alone is legitimate, and the summarize path stays silent about it too.
+        if not sys.stdin.isatty():
+            sys.exit("No question given, and stdin is not a terminal. "
+                     "Pass one: tldw ask 'your question'")
 
 
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] == "ask":
-        cmd_ask(sys.argv[2:])
-    else:
-        cmd_summarize(sys.argv[1:])
+    try:
+        if len(sys.argv) > 1 and sys.argv[1] == "ask":
+            cmd_ask(sys.argv[2:])
+        else:
+            cmd_summarize(sys.argv[1:])
+    except BackendError as e:
+        sys.exit(str(e))
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 
 if __name__ == "__main__":
