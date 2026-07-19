@@ -395,6 +395,16 @@ def cmd_summarize(argv: list[str]) -> None:
     if len(transcript) < 200:
         sys.exit("Transcript too short to summarize.")
 
+    entry = {
+        "id": video_id, "url": args.url, "title": title,
+        "transcript": transcript, "ts": int(time.time()),
+    }
+    # Bank the transcript before calling the model. Fetching it is the slow,
+    # rate-limited half, so if the summary then fails a rerun shouldn't re-pay
+    # for it. This is the case CACHE_FIELDS omits `summary` for.
+    if not hit:
+        cache_write(entry)
+
     label = model if backend == "openrouter" else "claude -p"
     print(f"Summarizing ({label}): {title}\n", file=sys.stderr)
 
@@ -402,10 +412,7 @@ def cmd_summarize(argv: list[str]) -> None:
     summary = respond(messages, backend, model)
     messages.append({"role": "assistant", "content": summary})
 
-    cache_write({
-        "id": video_id, "url": args.url, "title": title,
-        "transcript": transcript, "summary": summary, "ts": int(time.time()),
-    })
+    cache_write(entry | {"summary": summary})
 
     # Persist only explicit flags, and only after a successful run: resolved
     # values fold in env vars, which must stay transient, and a typo'd slug must
