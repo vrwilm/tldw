@@ -399,11 +399,16 @@ def cmd_summarize(argv: list[str]) -> None:
         "id": video_id, "url": args.url, "title": title,
         "transcript": transcript, "ts": int(time.time()),
     }
+    # Carry any existing summary forward: this pre-write would otherwise erase
+    # a good cached summary when a re-summarize fails.
+    if hit and hit.get("summary"):
+        entry["summary"] = hit["summary"]
     # Bank the transcript before calling the model. Fetching it is the slow,
     # rate-limited half, so if the summary then fails a rerun shouldn't re-pay
-    # for it. This is the case CACHE_FIELDS omits `summary` for.
-    if not hit:
-        cache_write(entry)
+    # for it. This is the case CACHE_FIELDS omits `summary` for. Unconditional
+    # so that `last` points at this video either way, and a follow-up `tldw ask`
+    # doesn't silently target whatever came before.
+    cache_write(entry)
 
     label = model if backend == "openrouter" else "claude -p"
     print(f"Summarizing ({label}): {title}\n", file=sys.stderr)

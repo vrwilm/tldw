@@ -22,8 +22,8 @@ demonstrates every rhetorical trick used to *sound* smart while saying nothing.
 It pulls the video's captions with `yt-dlp`, strips the timestamps, and sends the
 text to an LLM. No API-heavy scraping, no Whisper transcription, no browser.
 
-One file, ~300 lines. Summarizing a two-hour video costs about **$0.002** on the
-default model — or nothing at all on the `claude` backend. Ask it follow-up
+One file, no install step. Summarizing a two-hour video costs about **$0.002** on
+the default model — or nothing at all on the `claude` backend. Ask it follow-up
 questions with `-c`, or come back to any video later with `tldw ask`.
 
 ## Install
@@ -98,6 +98,10 @@ alongside its summary. Re-running a video you've already seen skips `yt-dlp`
 entirely — roughly two seconds instead of the usual fetch — and `tldw ask` reads
 straight from there.
 
+The transcript is written *before* the model is called, so if the summary fails
+(dead wifi, bad model name, rate limit) the fetch isn't wasted — the retry reads
+from cache. Fetching is the slow, rate-limited half; the summary is the cheap half.
+
 ```bash
 tldw 'https://...' --fresh    # ignore the cache and re-fetch
 rm -rf ~/.cache/tldw          # clear everything
@@ -156,8 +160,10 @@ mystery. The config is plain JSON — edit or `rm` it freely.
 - **English only.** It requests `en` caption tracks and gives up if none exist.
 - **Captions required.** No audio download, no Whisper fallback. Videos with
   captions disabled won't work.
-- **Auto-generated captions are imperfect** — missing punctuation, mangled proper
-  nouns, no speaker labels. Summaries inherit those flaws.
+- **Caption quality varies.** Human-written captions are preferred when a video
+  has them; otherwise it falls back to YouTube's auto-generated track, which
+  means missing punctuation, mangled proper nouns and no speaker labels.
+  Summaries inherit those flaws.
 - **Very long videos** are sent as a single request. Fine within a 1M-token
   context window, but a small-context model will reject a multi-hour transcript.
 
